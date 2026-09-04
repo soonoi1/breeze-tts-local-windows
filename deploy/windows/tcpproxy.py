@@ -34,6 +34,13 @@ def resolve_wsl_ipv4(distro: str) -> str:
     raise RuntimeError(f"No WSL IPv4 address found for distro {distro!r}: {result.stdout!r}")
 
 
+def connect_wsl(target_ip: str, wsl_port: int) -> socket.socket:
+    """Connect with a dial timeout, then wait indefinitely for model output."""
+    upstream = socket.create_connection((target_ip, wsl_port), timeout=10)
+    upstream.settimeout(None)
+    return upstream
+
+
 def pipe(source: socket.socket, destination: socket.socket) -> None:
     try:
         while True:
@@ -54,7 +61,10 @@ def handle(client: socket.socket, distro: str, wsl_port: int, log: logging.Logge
     upstream: socket.socket | None = None
     try:
         target_ip = resolve_wsl_ipv4(distro)
-        upstream = socket.create_connection((target_ip, wsl_port), timeout=10)
+        upstream = connect_wsl(target_ip, wsl_port)
+        # The timeout is only for TCP connection establishment. A model reload
+        # can legitimately take ~50s before the first response byte.
+        client.settimeout(None)
         log.info("bridge %s -> %s:%s", client.getpeername(), target_ip, wsl_port)
         left = threading.Thread(target=pipe, args=(client, upstream), daemon=True)
         right = threading.Thread(target=pipe, args=(upstream, client), daemon=True)

@@ -19,8 +19,9 @@ client converts PCM to WAV or schedules it directly
 ```
 
 The proxy resolves the WSL IP for each incoming connection, so a WSL2 IP change after reboot
-does not require editing a hard-coded address. The WSL API binds only inside the WSL path; the
-Windows proxy is the LAN entry point.
+does not require editing a hard-coded address. Its 10-second socket timeout applies only to
+connection establishment; after connect it switches both sockets back to blocking mode so a
+50-second lazy model reload cannot close an otherwise healthy request.
 
 ## Lifecycle
 

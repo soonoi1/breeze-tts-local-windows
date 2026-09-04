@@ -167,6 +167,8 @@ breeze-tts-local-windows/
    加载在后台线程中执行，避免阻塞 HTTP accept loop。
 5. API 有生成超时、无输出 stall 保护，以及带 owner id 的 request lease，避免取消请求
    后永久返回 `409`。
+6. Windows 转发器只对 `connect()` 设置 10 秒建连超时，连接成功后立即
+   `settimeout(None)`；模型懒加载首字节可能需要约 50 秒，不能让读 socket 继承 10 秒超时。
 
 ## 给公司电脑上的 AI 的操作指令
 
