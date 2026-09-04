@@ -4,6 +4,7 @@ outputs/
 runs/
 voices/*
 !voices/.gitkeep
+!voices/README.md
 *.safetensors
 *.bin
 *.pt
