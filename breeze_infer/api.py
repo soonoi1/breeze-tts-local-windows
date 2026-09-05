@@ -228,6 +228,12 @@ def _unload_app(app: FastAPI) -> None:
                 delattr(app.state, attr)
             except Exception:
                 pass
+    # Reset progress so the next cold start reports real stages instead of the
+    # stale "100 ready" from the previous load (clients poll /health while
+    # status says loading and would show a full ring jumping back to 5%).
+    with _load_progress_lock:
+        _load_progress["progress"] = 0
+        _load_progress["stage"] = "idle"
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
