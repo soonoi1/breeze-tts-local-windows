@@ -133,6 +133,7 @@ async def _save_upload(upload: UploadFile) -> Path:
 
 def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     global _last_activity
+    _set_load_progress(5, "loading tokenizer")
     tokenizer, model, audio_tokenizer = load_runtime(
         settings.model,
         device=resolve_device(),
@@ -140,6 +141,7 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     )
     update_generation_config_for_breeze(model)
 
+    _set_load_progress(50, "building fast runtime")
     config = FastStreamingConfig(
         max_new_tokens=MAX_NEW_TOKENS,
         max_seq_len=MAX_SEQ_LEN,
@@ -155,6 +157,7 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
         model, audio_tokenizer, config, tokenizer=tokenizer
     )
     if runtime.fast_enabled:
+        _set_load_progress(65, "capturing cuda graphs")
         profile = load_warmup_profile(FAST_CONFIG)
         profile = replace(profile, codec_chunk_frames=runtime.codec_chunk_frames)
         manifest = runtime.warmup_from_profile(profile)
@@ -164,9 +167,27 @@ def _load_app(app: FastAPI, settings: ApiSettings) -> None:
     app.state.model = model
     app.state.audio_tokenizer = audio_tokenizer
     app.state.runtime = runtime
+    _set_load_progress(100, "ready")
     # Loading takes tens of seconds; reset the idle clock so the watcher
     # does not immediately unload a freshly-loaded model.
     _last_activity = time.time()
+
+
+# --- load progress (thread-safe, read by /health) ---
+_load_progress_lock = threading.Lock()
+_load_progress = {"progress": 0, "stage": "idle"}
+
+
+def _set_load_progress(progress: int, stage: str) -> None:
+    with _load_progress_lock:
+        _load_progress["progress"] = progress
+        _load_progress["stage"] = stage
+    print(f"[load] {progress}% {stage}", flush=True)
+
+
+def _get_load_progress() -> tuple[int, str]:
+    with _load_progress_lock:
+        return _load_progress["progress"], _load_progress["stage"]
 
 
 _load_thread_lock = threading.Lock()
@@ -273,17 +294,48 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(title="Breeze TTS API", lifespan=_lifespan)
 
 
+@app.post("/warm")
+async def warm() -> JSONResponse:
+    """Start the lazy load immediately without waiting for a synthesis.
+
+    Fire-and-forget warm kick used by clients when a voice session opens: the
+    load runs in a daemon thread (ensure_loaded_async) and this returns at once.
+    """
+    if hasattr(app.state, "runtime"):
+        return JSONResponse({"status": "ok", "progress": 100, "stage": "ready"})
+    global _last_activity
+    _last_activity = time.time()
+    asyncio.get_event_loop().create_task(ensure_loaded_async_wrapper())
+    return JSONResponse({"status": "loading", "progress": _get_load_progress()[0], "stage": _get_load_progress()[1]}, status_code=202)
+
+
+async def ensure_loaded_async_wrapper() -> None:
+    try:
+        await ensure_loaded_async(app)
+    except BaseException as exc:  # daemon task: never propagate
+        print(f"[warm] background load failed: {exc}", flush=True)
+
+
 @app.get("/health")
 def health() -> JSONResponse:
     if not hasattr(app.state, "runtime"):
+        progress, stage = _get_load_progress()
         return JSONResponse(
-            {"status": "loading", "model": "idle"}, status_code=503
+            {
+                "status": "loading",
+                "model": "idle",
+                "progress": progress if progress > 0 else 0,
+                "stage": stage,
+            },
+            status_code=503,
         )
     return JSONResponse(
         {
             "status": "ok",
             "sample_rate": app.state.runtime.sample_rate,
             "model": "loaded",
+            "progress": 100,
+            "stage": "ready",
         }
     )
 
