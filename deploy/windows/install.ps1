@@ -15,6 +15,23 @@ $ErrorActionPreference = 'Stop'
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $WindowsPython = $null
 
+# Minimum NVIDIA Windows driver for CUDA 12.8 wheels inside WSL2. Older
+# drivers are the most common cause of a dead /dev/dxg after a silent update.
+$MinDriverVersion = [version]'550.0'
+
+function Write-Step([string]$Message) {
+  Write-Host ''
+  Write-Host "=== $Message ==="
+}
+
+function Invoke-Checked {
+  # PowerShell does not stop on failed external commands even with
+  # $ErrorActionPreference = 'Stop'; check $LASTEXITCODE explicitly.
+  param([string]$Description, [scriptblock]$Command)
+  & $Command
+  if ($LASTEXITCODE -ne 0) { throw "$Description failed with exit code $LASTEXITCODE" }
+}
+
 function Resolve-Python {
   $py = Get-Command py.exe -ErrorAction SilentlyContinue
   if ($null -ne $py) {
@@ -52,6 +69,37 @@ function Get-GpuMemoryMb {
   $number = 0
   if ([int]::TryParse($value, [ref]$number)) { return $number }
   return $null
+}
+
+function Get-GpuDriverVersion {
+  $smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+  if ($null -eq $smi) { return $null }
+  $value = (& $smi.Source --query-gpu=driver_version --format=csv,noheader 2>$null | Select-Object -First 1).Trim()
+  $parsed = $null
+  if ([version]::TryParse($value, [ref]$parsed)) { return $parsed }
+  return $null
+}
+
+function Assert-PortFree([int]$ListenPort) {
+  $conns = Get-NetTCPConnection -LocalPort $ListenPort -State Listen -ErrorAction SilentlyContinue
+  if (-not $conns) {
+    Write-Host "PORT_FREE=$ListenPort"
+    return
+  }
+  foreach ($conn in $conns) {
+    $cmdline = ''
+    try {
+      $cmdline = (Get-CimInstance Win32_Process -Filter "ProcessId=$($conn.OwningProcess)").CommandLine
+    } catch { }
+    if ($cmdline -match 'tcpproxy\.py' -or $cmdline -match 'breeze_infer\.api') {
+      Write-Host "PORT_BUSY_WITH_OLD_BREEZE=$ListenPort pid=$($conn.OwningProcess); stopping it"
+      Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
+      Start-Sleep -Seconds 1
+    } else {
+      throw ("Port $ListenPort is already used by PID $($conn.OwningProcess) ($cmdline). " +
+             "Stop that program, or rerun install.ps1 with -Port <other>.")
+    }
+  }
 }
 
 function Test-UsableWsl {
@@ -100,11 +148,29 @@ function Wait-ForHealth {
 }
 
 Write-Host "REPO_ROOT=$RepoRoot"
+Write-Step 'STEP 1/6 Python'
 Ensure-Python
+
+Write-Step 'STEP 2/6 GPU & driver'
+$smi = Get-Command nvidia-smi.exe -ErrorAction SilentlyContinue
+if ($null -eq $smi) {
+  throw 'nvidia-smi.exe was not found. Install the NVIDIA Game Ready / Studio driver (it bundles the WSL CUDA driver) and rerun.'
+}
 $gpuMb = Get-GpuMemoryMb
+$driverVersion = Get-GpuDriverVersion
+Write-Host "GPU_MEMORY_MB=$gpuMb DRIVER_VERSION=$driverVersion"
+if ($null -ne $driverVersion -and $driverVersion -lt $MinDriverVersion) {
+  Write-Warning ("NVIDIA driver $driverVersion is older than $MinDriverVersion. " +
+    'CUDA 12.8 wheels in WSL2 need a 550+ driver; update it before reporting a broken /dev/dxg.')
+}
+if (-not $gpuMb) {
+  throw 'nvidia-smi exists but could not report GPU memory. The GPU or its WSL driver is not healthy; see docs/TROUBLESHOOTING.md (dxg).'
+}
+
+Write-Step 'STEP 3/6 WSL & port'
 $wslAvailable = Test-UsableWsl
 if ($Mode -eq 'auto') {
-  if ($wslAvailable -and $gpuMb -and $gpuMb -ge 22000) {
+  if ($wslAvailable -and $gpuMb -ge 22000) {
     $resolvedMode = 'wsl'
   } else {
     $resolvedMode = 'native'
@@ -115,9 +181,14 @@ if ($Mode -eq 'auto') {
 if ($resolvedMode -eq 'wsl' -and -not $wslAvailable) {
   throw "WSL distro '$DistroName' is not usable. Install/enable WSL2 and Ubuntu, reboot if Windows requests it, then rerun with -Mode wsl. Use -Mode auto to avoid a reboot and deploy native eager instead."
 }
-Write-Host "GPU_MEMORY_MB=$gpuMb WSL_AVAILABLE=$wslAvailable SELECTED_MODE=$resolvedMode"
+Write-Host "WSL_AVAILABLE=$wslAvailable SELECTED_MODE=$resolvedMode"
+if ($resolvedMode -eq 'native' -and $gpuMb -lt 8000) {
+  Write-Warning 'Native eager mode needs ~8 GiB VRAM; this GPU reports less and generation may fail or swap to system memory.'
+}
+Assert-PortFree $Port
 
 if ($resolvedMode -eq 'wsl') {
+  Write-Step 'STEP 4/6 WSL2 dependencies + model'
   $wsl = (Get-Command wsl.exe -ErrorAction Stop).Source
   $wslRepo = (& $wsl -d $DistroName -- wslpath -a $RepoRoot 2>$null | Select-Object -Last 1).Trim()
   if (-not $wslRepo) { throw 'Could not translate the Windows repository path into WSL.' }
@@ -137,29 +208,28 @@ if ($resolvedMode -eq 'wsl') {
   & $wsl @wslArgs
   if ($LASTEXITCODE -ne 0) { throw "WSL installation failed with exit code $LASTEXITCODE" }
   Stop-TaskIfPresent 'Breeze TTS Native'
+  Write-Step 'STEP 5/6 register scheduled tasks'
   Invoke-RegisterTasks -ResolvedMode 'wsl' -NativePython $WindowsPython -NativeModel ''
 } else {
+  Write-Step 'STEP 4/6 native Windows dependencies + model'
   $nativeRoot = Join-Path $RepoRoot '.venv-native'
   $nativePython = Join-Path $nativeRoot 'Scripts\python.exe'
   $modelDir = Join-Path $RepoRoot 'data\models\Breeze-TTS-2'
   New-Item -ItemType Directory -Force -Path (Join-Path $RepoRoot 'data\models') | Out-Null
   if (-not (Test-Path $nativePython)) {
-    & $WindowsPython -m venv $nativeRoot
-    if ($LASTEXITCODE -ne 0) { throw "native venv creation failed with exit code $LASTEXITCODE" }
+    Invoke-Checked 'native venv creation' { & $WindowsPython -m venv $nativeRoot }
   }
   Write-Host 'Installing native Windows Python dependencies...'
-  & $nativePython -m pip install --upgrade pip --index-url $PypiIndexUrl
-  & $nativePython -m pip install --upgrade --index-url $TorchIndexUrl torch==2.9.1 torchaudio==2.9.1
-  & $nativePython -m pip install --upgrade --index-url $PypiIndexUrl -r (Join-Path $RepoRoot 'requirements.txt')
-  if ($LASTEXITCODE -ne 0) { throw "native dependency installation failed with exit code $LASTEXITCODE" }
+  Invoke-Checked 'pip upgrade' { & $nativePython -m pip install --upgrade pip --index-url $PypiIndexUrl }
+  Invoke-Checked 'torch install' { & $nativePython -m pip install --upgrade --index-url $TorchIndexUrl torch==2.9.1 torchaudio==2.9.1 }
+  Invoke-Checked 'requirements install' { & $nativePython -m pip install --upgrade --index-url $PypiIndexUrl -r (Join-Path $RepoRoot 'requirements.txt') }
   if (-not $SkipModel) {
-    & $nativePython (Join-Path $RepoRoot 'scripts\download_model.py') --dest $modelDir --endpoint $HfEndpoint
-    if ($LASTEXITCODE -ne 0) { throw "model download failed with exit code $LASTEXITCODE" }
+    Invoke-Checked 'model download' { & $nativePython (Join-Path $RepoRoot 'scripts\download_model.py') --dest $modelDir --endpoint $HfEndpoint }
   }
   if (-not (Test-Path (Join-Path $modelDir 'config.json'))) {
     throw "Model checkpoint is missing: $modelDir\config.json. Remove -SkipModel or put a complete checkpoint there."
   }
-  & $nativePython (Join-Path $RepoRoot 'scripts\patch_model_config.py') $modelDir
+  Invoke-Checked 'config patch' { & $nativePython (Join-Path $RepoRoot 'scripts\patch_model_config.py') $modelDir }
   $userEnv = @{
     BREEZE_MODEL_DIR = $modelDir
     BREEZE_FAST_MODE = 'eager'
@@ -174,10 +244,12 @@ if ($resolvedMode -eq 'wsl') {
   }
   Stop-TaskIfPresent 'Breeze TTS WSL'
   Stop-TaskIfPresent 'Breeze TTS PortProxy'
+  Write-Step 'STEP 5/6 register scheduled tasks'
   Invoke-RegisterTasks -ResolvedMode 'native' -NativePython $nativePython -NativeModel $modelDir
 }
 
 if (-not $NoAutoStart) {
+  Write-Step 'STEP 6/6 start service and wait for /health'
   $start = Join-Path $RepoRoot 'deploy\windows\start.ps1'
   & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $start -Mode $resolvedMode
   if ($LASTEXITCODE -ne 0) { throw "service start failed with exit code $LASTEXITCODE" }

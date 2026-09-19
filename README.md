@@ -1,5 +1,7 @@
 # Breeze TTS Local Windows
 
+[![CI](https://github.com/soonoi1/breeze-tts-local-windows/actions/workflows/ci.yml/badge.svg)](https://github.com/soonoi1/breeze-tts-local-windows/actions/workflows/ci.yml)
+
 > 一键把 Breeze TTS 2 本地模型部署到 Windows NVIDIA GPU 电脑，提供流式语音生成 API。
 >
 > This repository packages the official Breeze TTS 2 PyTorch inference code together with a
@@ -41,6 +43,80 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\install.ps1 -Mode nati
 
 > 第一次下载模型和 WSL2 fast-all 的 CUDA graph 预热需要较长时间。安装器会等待健康检查，
 > 不要因为前几分钟没有声音就重复启动第二个实例。
+
+## 从零到出声（快速开始）
+
+面向没用过命令行的同事。全程约 30–60 分钟，其中大部分时间是等下载。
+
+### 第 0 步：确认这台电脑能用
+
+| 条件 | 怎么确认 | 不满足怎么办 |
+|---|---|---|
+| NVIDIA 显卡，建议 ≥ 24 GB 显存 | 桌面右键 →「NVIDIA 控制面板」，或任务管理器 → 性能 → GPU | 显存 8 GB 以上也能装（自动用较慢的兼容模式） |
+| 磁盘剩余 ≥ 20 GB | 文件资源管理器看 C 盘（或 clone 仓库的盘） | 清理空间，模型文件就有 7.7 GB |
+| 能装软件的权限（管理员） | 问 IT；安装过程会弹 UAC 授权框 | 让 IT 协助一次，之后日常使用不需要管理员 |
+| NVIDIA 驱动已装 | 任务管理器 → GPU 能看到 NVIDIA 条目 | 先装驱动再回来 |
+
+### 第 1 步：打开 PowerShell
+
+按 `Win + X`，点菜单里的「终端」或「Windows PowerShell」。
+（开始菜单搜 "powershell" 也能找到。看到蓝色/黑色窗口、有闪烁光标就是成功了。）
+
+### 第 2 步：把仓库下载到本机
+
+在窗口里输入下面这行，按回车（输入完一行都按一次回车，下同）：
+
+```powershell
+git clone https://github.com/soonoi1/breeze-tts-local-windows.git
+```
+
+- 提示 `git 不是内部或外部命令` → 先装 git：开始菜单搜 "Microsoft Store" 打开
+  搜索 "Git" 安装；或到 https://git-scm.com/download/win 下载安装（一路下一步）。
+  装完**关掉 PowerShell 重新打开**，再输上面的命令。
+- 成功的标志：最后显示 `done` 或 `Checking connectivity... done.`，并且
+  `cd breeze-tts-local-windows` 能进入文件夹：
+
+```powershell
+cd breeze-tts-local-windows
+```
+
+### 第 3 步：一键安装
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy\windows\install.ps1
+```
+
+接下来全自动，你只需要：
+- 弹出「用户账户控制」时点「是」；
+- 看到带 `STEP x/6` 的进度输出。中间会下载约 7.7 GB 模型（走国内镜像，自动断点续传，
+  网络抖动会自动重试），WSL2 模式首次启动还要编译加速内核，**总共 10–40 分钟正常**。
+
+成功的标志：窗口最后出现
+
+```text
+BREEZE_INSTALL_COMPLETE
+HEALTH_OK=...
+API=http://127.0.0.1:9000
+```
+
+- 卡在某一步超过 30 分钟 / 报红字 → 不要慌，把窗口滚动截图，
+  查 `docs\TROUBLESHOOTING.md` 对应条目，或找 IT。**不要**重复执行安装命令。
+
+### 第 4 步：让它出声
+
+```powershell
+python .\examples\http_client.py --text "你好，这是本地 Breeze TTS。" --output .\outputs\hello.wav
+```
+
+成功的标志：显示 `WROTE=outputs\hello.wav`。到仓库文件夹的 `outputs` 里
+**双击 `hello.wav`**，能听到中文语音 = 部署完成。
+
+### 日常使用
+
+- 服务是**开机自启**的（登录后约 1 分钟内可用），平时不用管。
+- 手动检查状态：`powershell -ExecutionPolicy Bypass -File .\deploy\windows\health.ps1`
+- 换声音、调参数、改端口 → `docs\CONFIG.md`
+- 出了任何问题 → `docs\TROUBLESHOOTING.md`（按症状索引）
 
 ## 安装完成后的 API
 
@@ -152,6 +228,9 @@ breeze-tts-local-windows/
 ├── scripts/patch_model_config.py # eager attention 配置补丁
 ├── deploy/windows/               # 一键安装、计划任务、健康检查、转发器
 ├── deploy/wsl/                   # WSL2 依赖、启动、停止脚本
+├── docs/architecture.md          # 架构与 API 协议（面向开发者/AI）
+├── docs/TROUBLESHOOTING.md       # 故障排查（按症状索引，出问题先看这个）
+├── docs/CONFIG.md                # 全部配置项、密钥格式、性能档位
 ├── config/.env.example           # 可覆盖的运行参数
 └── voices/                       # 本地参考音频目录（仅保留 .gitkeep）
 ```
@@ -169,6 +248,11 @@ breeze-tts-local-windows/
    后永久返回 `409`。
 6. Windows 转发器只对 `connect()` 设置 10 秒建连超时，连接成功后立即
    `settimeout(None)`；模型懒加载首字节可能需要约 50 秒，不能让读 socket 继承 10 秒超时。
+7. 安装脚本对 `/dev/dxg`、`nvidia-smi`、磁盘空间、端口占用做前置检查。背景：
+   PC 显卡驱动曾被 Windows 静默升级到 616.64，WSL 的 `/dev/dxg` 随即失效，
+   之前直到安装/启动阶段才暴露。相关排查见 `docs/TROUBLESHOOTING.md` 第 1 条。
+8. WSL 内服务空闲 `BREEZE_IDLE_TIMEOUT` 秒（默认 120）自动卸载模型释放显存，
+   下一次请求自动懒加载（约 50 秒）。测试循环用 `BREEZE_IDLE_TIMEOUT=20`。
 
 ## 给公司电脑上的 AI 的操作指令
 

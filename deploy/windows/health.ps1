@@ -17,5 +17,11 @@ try {
       Write-Host "TASK=$name STATE=$($task.State) LAST_RESULT=$($info.LastTaskResult)"
     }
   }
+  Write-Host ''
+  Write-Host 'Quick checks:'
+  Write-Host '  1. Task state above should be Running. LAST_RESULT other than 0 = the process crashed; check the log below.'
+  Write-Host '  2. WSL mode API log: wsl -d Ubuntu -u root -- tail -50 /opt/breeze-tts-data/logs/breeze-api.log'
+  Write-Host '  3. Proxy log: Get-Content <repo>\data\breeze-proxy.log -Tail 50'
+  Write-Host '  4. GPU dead after a driver update? wsl -d Ubuntu -- nvidia-smi  (if this fails: wsl --shutdown, wait 8 s, retry — docs\TROUBLESHOOTING.md)'
   exit 1
 }
