@@ -1,5 +1,7 @@
 # Breeze TTS Local Windows
 
+[![CI](https://github.com/soonoi1/breeze-tts-local-windows/actions/workflows/ci.yml/badge.svg)](https://github.com/soonoi1/breeze-tts-local-windows/actions/workflows/ci.yml)
+
 > 一键把 Breeze TTS 2 本地模型部署到 Windows NVIDIA GPU 电脑，提供流式语音生成 API。
 >
 > This repository packages the official Breeze TTS 2 PyTorch inference code together with a
